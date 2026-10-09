@@ -1,6 +1,9 @@
-langgraph
-langchain-openai
-pydantic
-requests
-python-dotenv
-langgraph-cli[inmem]
+fastapi==0.142.2
+uvicorn==0.54.0
+sse-starlette==3.5.0
+langchain==1.4.3
+langchain-openai==1.6.7
+langchain-typesafe==0.0.1a3
+pydantic>=2.7,<3
+pydantic-settings>=2.2,<3
+python-dotenv>=1,<2

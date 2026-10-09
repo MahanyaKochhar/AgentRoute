@@ -2,3 +2,5 @@
 __pycache__
 .env
 .langgraph_api
+
+.pytest_cache
