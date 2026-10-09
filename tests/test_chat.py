@@ -9,7 +9,7 @@ from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 import src.agent as agent_module
 import src.service as service_module
@@ -22,18 +22,29 @@ from src.settings import Settings
 from src.tools import HEALTHCARE_TOOLS
 
 
-class FakeClassifier:
+class FakeDecisions:
     def __init__(self, selected=('pubmed_search_articles',)):
         self.selected = selected
         self.calls = []
 
-    async def ainvoke(self, request):
+    @property
+    def decisions(self):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def create(self, **request):
         await asyncio.sleep(0)
         self.calls.append(request)
-        return SimpleNamespace(nouls={
-            name: SimpleNamespace(noul=0.5 if name in self.selected else 0.1)
-            for name in request['questions']
-        })
+        return SimpleNamespace(answers=[
+            SimpleNamespace(type="predicate", name=q["name"],
+                            probability=0.5 if q["name"] in self.selected else 0.1)
+            for q in request["questions"]
+        ])
 
 
 class ToolChatModel(BaseChatModel):
@@ -70,14 +81,15 @@ class ToolChatModel(BaseChatModel):
 def configured_agent(monkeypatch):
     def build(selected=('pubmed_search_articles',), call_tool=True):
         model = ToolChatModel(call_tool=call_tool)
-        classifier = FakeClassifier(selected)
+        classifier = FakeDecisions(selected)
         settings = lambda: SimpleNamespace(
-            jev_model='jev-latest', jev_timeout_seconds=30, tool_threshold=0.5,
+            openai_api_key=SecretStr('test-key'), decision_model='gpt-6-luna',
+            decision_timeout_seconds=30, tool_threshold=0.5,
         )
         monkeypatch.setattr(agent_module, 'Settings', settings)
         monkeypatch.setattr(middleware_module, 'Settings', settings)
         monkeypatch.setattr(agent_module, 'get_llm', lambda settings: model)
-        monkeypatch.setattr(middleware_module, 'TypeSafeClassifier', lambda **kwargs: classifier)
+        monkeypatch.setattr(middleware_module, 'AsyncOpenAI', lambda **kwargs: classifier)
         return agent_module.build_agent(), model, classifier
     return build
 
@@ -93,9 +105,9 @@ async def test_real_agent_executes_selected_tool_and_reuses_scores(configured_ag
     message = 'Find diabetes publications and trials'
     result = await agent.ainvoke({'request': message, 'messages': [{'role': 'user', 'content': message}]})
     assert len(classifier.calls) == 1
-    assert classifier.calls[0]['state'] == message
+    assert classifier.calls[0]['input'] == message
     assert len(classifier.calls[0]['questions']) == 94
-    assert all(q.type == 'noul' for q in classifier.calls[0]['questions'].values())
+    assert all(q['type'] == 'predicate' for q in classifier.calls[0]['questions'])
     assert model.bound_tools == [['clinicaltrials_gov_search_trials', 'pubmed_search_articles']] * 2
     outputs = [m for m in result['messages'] if isinstance(m, ToolMessage)]
     assert len(outputs) == 1
@@ -152,15 +164,16 @@ async def test_empty_selection_allows_direct_response(configured_agent, monkeypa
 
 @pytest.mark.asyncio
 async def test_concurrent_requests_keep_their_own_tool_selection(monkeypatch):
-    class RequestClassifier(FakeClassifier):
-        async def ainvoke(self, request):
-            classifier = FakeClassifier(('pubmed_search_articles',) if request['state'] == 'papers'
+    class RequestDecisions(FakeDecisions):
+        async def create(self, **request):
+            classifier = FakeDecisions(('pubmed_search_articles',) if request['input'] == 'papers'
                                         else ('rxnorm_search_drugs',))
-            return await classifier.ainvoke(request)
+            return await classifier.create(**request)
 
-    monkeypatch.setattr(middleware_module, "TypeSafeClassifier", lambda **kwargs: RequestClassifier())
+    monkeypatch.setattr(middleware_module, "AsyncOpenAI", lambda **kwargs: RequestDecisions())
     monkeypatch.setattr(middleware_module, "Settings", lambda: SimpleNamespace(
-        jev_model="jev-latest", jev_timeout_seconds=30, tool_threshold=0.5,
+        openai_api_key=SecretStr("test-key"), decision_model="gpt-6-luna",
+        decision_timeout_seconds=30, tool_threshold=0.5,
     ))
     async def route(message):
         request = ModelRequest(model=ToolChatModel(call_tool=False), messages=[], tools=HEALTHCARE_TOOLS,
@@ -178,12 +191,12 @@ async def test_concurrent_requests_keep_their_own_tool_selection(monkeypatch):
 
 
 def test_classifier_failure_emits_sse_error_without_calling_model(configured_agent, monkeypatch):
-    class FailedClassifier:
-        async def ainvoke(self, request):
+    class FailedDecisions(FakeDecisions):
+        async def create(self, **request):
             raise RuntimeError('private upstream failure')
 
     agent, model, _ = configured_agent()
-    monkeypatch.setattr(middleware_module, 'TypeSafeClassifier', lambda **kwargs: FailedClassifier())
+    monkeypatch.setattr(middleware_module, 'AsyncOpenAI', lambda **kwargs: FailedDecisions())
     service_for(monkeypatch, agent_module.build_agent())
     with TestClient(app) as client:
         response = client.post('/chat', json={'message': 'Find publications'})
@@ -265,3 +278,78 @@ async def test_http_disconnect_cancels_underlying_agent(monkeypatch):
         }, receive, send), timeout=3)
     assert closed.is_set()
     assert not any(b'event: done' in event.get('body', b'') for event in sent)
+
+
+def test_blank_openai_key_allows_startup_but_blocks_routing(configured_agent, monkeypatch):
+    agent, model, decisions = configured_agent()
+    original_settings = middleware_module.Settings
+    def blank_settings():
+        settings = original_settings()
+        settings.openai_api_key = SecretStr('')
+        return settings
+    monkeypatch.setattr(middleware_module, 'Settings', blank_settings)
+    service_for(monkeypatch, agent)
+    with TestClient(app) as client:
+        assert client.get('/openapi.json').status_code == 200
+        response = client.post('/chat', json={'message': 'Find publications'})
+    assert 'event: error' in response.text
+    assert not decisions.calls
+    assert not model.bound_tools
+
+
+@pytest.mark.parametrize('invalid', ['refusal', 'missing', 'duplicate', 'unknown', 'nan', 'out_of_range'])
+def test_invalid_decision_answers_stop_routing(invalid):
+    answers = [SimpleNamespace(type='predicate', name=q['name'], probability=0.5)
+               for q in middleware_module.QUESTIONS]
+    if invalid == 'refusal':
+        answers[0] = SimpleNamespace(type='refusal', name=answers[0].name)
+    elif invalid == 'missing':
+        answers.pop()
+    elif invalid == 'duplicate':
+        answers.append(answers[0])
+    elif invalid == 'unknown':
+        answers[0].name = 'unknown'
+    elif invalid == 'nan':
+        answers[0].probability = float('nan')
+    else:
+        answers[0].probability = 1.1
+    with pytest.raises(ValueError):
+        middleware_module.predicate_scores(answers)
+
+
+@pytest.mark.asyncio
+async def test_real_openai_sdk_decisions_contract(configured_agent, monkeypatch):
+    import httpx2
+    from openai import AsyncOpenAI
+
+    agent, model, _ = configured_agent()
+    requests = []
+    async def respond(request):
+        assert request.method == 'POST'
+        assert str(request.url) == 'https://api.openai.com/v1/decisions'
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body['model'] == 'gpt-6-luna'
+        assert body['input'] == 'Find publications'
+        assert len(body['questions']) == 94
+        assert all(q['type'] == 'predicate' for q in body['questions'])
+        # Use reversed answers to prove matching is by name, not position.
+        return httpx2.Response(200, json={
+            'model': body['model'],
+            'answers': [{'type': 'predicate', 'name': q['name'],
+                         'probability': 0.9 if q['name'] == 'pubmed_search_articles' else 0.1}
+                        for q in reversed(body['questions'])],
+            'usage': {'input_tokens': 1, 'output_tokens': 0, 'total_tokens': 1,
+                      'input_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 0},
+                      'output_tokens_details': {'reasoning_tokens': 0}},
+        })
+
+    client = AsyncOpenAI(api_key='test-key', base_url='https://api.openai.com/v1',
+                         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(respond)))
+    monkeypatch.setattr(middleware_module, 'AsyncOpenAI', lambda **kwargs: client)
+    result = await agent.ainvoke({'request': 'Find publications',
+                                 'messages': [{'role': 'user', 'content': 'Find publications'}]})
+    assert len(requests) == 1
+    assert model.bound_tools == [['pubmed_search_articles']] * 2
+    assert result['tool_scores']['pubmed_search_articles'] == 0.9
+    assert client.is_closed()

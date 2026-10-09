@@ -1,6 +1,6 @@
 # Stream
 
-FastAPI `POST /chat` backed by a LangChain agent. Jev selects relevant healthcare
+FastAPI `POST /chat` backed by a LangChain agent. OpenAI Decisions predicates select relevant healthcare
 tools from the user request, and the response streams as Server-Sent Events (SSE).
 
 ## Code layout
@@ -11,7 +11,7 @@ All application code lives directly in `src/`:
 - `resource.py`: validates the chat request and returns an SSE response.
 - `service.py`: owns the agent and streams its response text.
 - `streaming.py`: converts text into native JSON SSE events.
-- `agent.py`: parameterless `build_agent()` using the configured model and Jev.
+- `agent.py`: parameterless `build_agent()` using Navigator and `middleware=[select_tools]`.
 - `middleware.py`: async `@wrap_model_call` decorator, passed directly as `middleware=[select_tools]`.
 - `tools.py`: all static Healthcare Public Data tool operations.
 - `state.py`: messages, the original request, and per-run routing scores.
@@ -20,11 +20,16 @@ All application code lives directly in `src/`:
 
 ## Routing
 
-The middleware sends `state["request"]` and one named yes/no `Noul` question per
-tool to `TypeSafeClassifier` in a single async invocation. Jev evaluates the
-questions independently in parallel. Tools with relevance probability at least
-`TOOL_THRESHOLD` are exposed with `request.override(tools=selected_tools)`.
-Zero, one, or multiple tools can qualify.
+The decorated `select_tools` middleware sends `state["request"]` as shared input
+and one named `predicate` per tool in a single `AsyncOpenAI.decisions.create`
+request. Each question asks whether the tool's specific capabilities are useful
+for the request. Tools whose probability meets `TOOL_THRESHOLD` are exposed with
+`request.override(tools=selected_tools)`. Zero, one, or several tools can qualify.
+
+Answers are matched by tool name. Refusals, missing or duplicate answers, and
+invalid probabilities stop routing and produce the standard SSE error event.
+The SDK client closes after classification and uses a 30-second timeout with up
+to two retries. Navigator remains the model that generates the response.
 
 All tools are registered when the agent is built so selected tools can execute.
 Scores are saved in the individual run's state with `ExtendedModelResponse` and
@@ -72,22 +77,33 @@ cp .env.example .env
 ```
 
 Set the existing `NAVIGATOR_API_KEY`, `NAVIGATOR_API_ENDPOINT`, and
-`NAVIGATOR_MODEL`, plus `TYPESAFE_API_KEY`, in `.env`. Navigator must support
-streaming chat completions and tool calling. Its endpoint can be a base URL or
-full `.../v1/chat/completions` URL; normalization preserves `/v1`.
+`NAVIGATOR_MODEL` in `.env`. Navigator must support streaming chat completions and
+tool calling. Its endpoint can be a base URL or full `.../v1/chat/completions` URL;
+normalization preserves `/v1`.
 
-Get a Jev API key from [TypeSafe](https://console.typesafe.ai). The classifier
-reads `TYPESAFE_API_KEY` and optional `TYPESAFE_BASE_URL` directly. The original
-request is sent to Jev for routing and Navigator for answering. Optional settings:
+`OPENAI_API_KEY` is intentionally blank in `.env.example`, and settings default
+to a blank key. The app can start in this state, but `/chat` emits an SSE error
+until a key is configured. No placeholder credential is sent to OpenAI. Routing
+uses `https://api.openai.com/v1/decisions`; the deployment needs network access
+to `api.openai.com`. The original request is sent to OpenAI for routing and to
+Navigator for answering.
 
 | Setting | Default |
 | --- | --- |
-| `JEV_MODEL` | `jev-latest` |
-| `JEV_TIMEOUT_SECONDS` | `30` |
+| `OPENAI_API_KEY` | blank |
+| `DECISION_MODEL` | `gpt-6-luna` |
+| `DECISION_TIMEOUT_SECONDS` | `30` |
 | `TOOL_THRESHOLD` | `0.5` (in `(0, 1]`) |
 
-The TypeSafe integration is a prerelease; its tested version is pinned in
-`requirements.txt`. No LangGraph dev server or LangSmith key is required.
+The threshold is an initial configurable value, not a calibrated accuracy claim.
+Before production, tune it on labeled requests to balance missed relevant tools
+against unnecessary tool exposure, as recommended in the
+[Decisions guide](https://developers.openai.com/api/docs/guides/decisions).
+The OpenAI SDK version supporting Decisions is pinned in `requirements.txt`.
+No LangGraph dev server or LangSmith key is required.
+
+The `jev_routing` branch preserves the Jev implementation. This branch,
+`decision_routing`, replaces the router with OpenAI Decisions.
 
 ## Run
 
@@ -145,13 +161,13 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-Tests patch configured dependencies with fake classifiers and chat models while
+Tests patch configured dependencies with fake Decisions clients and chat models while
 exercising the real LangChain agent and FastAPI endpoint. They check catalogue
 coverage, batched scoring, tool selection and execution, score reuse, concurrent
 request isolation, streamed text, validation, error events, and disconnects.
-No API keys or paid API requests are needed for these tests.
+A transport-level test also exercises the actual OpenAI SDK against a mock HTTP
+response. No API keys or paid API requests are needed for these tests.
 
 Implementation references:
-[Building a Harness with Jev](https://www.langchain.com/blog/building-a-harness-with-jev),
-[TypeSafe integration](https://docs.langchain.com/oss/python/integrations/providers/typesafe),
+[OpenAI Decisions guide](https://developers.openai.com/api/docs/guides/decisions),
 [LangChain wrap-style hooks](https://docs.langchain.com/oss/python/langchain/middleware/custom#wrap-style-hooks).
