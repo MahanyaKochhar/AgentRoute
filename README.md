@@ -1,7 +1,8 @@
 # Stream
 
 FastAPI chat API with LangChain, OpenAI Decisions tool routing, and SSE.
-All application code is in `src/`.
+All application code is in `src/`. `ChatResource` constructs its `ChatService`
+directly and registers `/chat` with a decorator; no lifespan initialization.
 
 ```text
 main → ChatResource (owns ChatService) → agent → select_tools → tools

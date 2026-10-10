@@ -3,5 +3,5 @@ from fastapi import FastAPI
 
 from src.resource import resource
 
-app = FastAPI(title="Stream", lifespan=resource.lifespan)
+app = FastAPI(title="Stream")
 app.include_router(resource.router)

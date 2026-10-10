@@ -14,7 +14,12 @@ from pydantic import Field, SecretStr
 import src.agent as agent_module
 import src.service as service_module
 import src.middleware as middleware_module
-from src.main import app
+from unittest.mock import patch
+
+# Resource construction is eager; replace model assembly before importing the app.
+with patch("src.service.build_agent", return_value=None):
+    from src.main import app
+    from src.resource import resource
 from src.middleware import select_tools
 from src.navigator_llm import get_llm
 from src.service import ChatService
@@ -96,7 +101,9 @@ def configured_agent(monkeypatch):
 
 def service_for(monkeypatch, agent):
     monkeypatch.setattr(service_module, 'build_agent', lambda: agent)
-    return ChatService()
+    service = ChatService()
+    monkeypatch.setattr(resource, 'service', service)
+    return service
 
 
 @pytest.mark.asyncio
@@ -290,7 +297,7 @@ async def test_http_disconnect_cancels_underlying_agent(monkeypatch):
     assert not any(b'event: response.completed' in event.get('body', b'') for event in sent)
 
 
-def test_blank_openai_key_allows_startup_but_blocks_routing(configured_agent, monkeypatch):
+def test_blank_openai_key_allows_app_but_blocks_routing(configured_agent, monkeypatch):
     agent, model, decisions = configured_agent()
     original_settings = middleware_module.Settings
     def blank_settings():
@@ -369,7 +376,7 @@ def test_resource_owns_one_service_with_independent_request_state(configured_age
     from src.resource import resource
 
     agent, _, decisions = configured_agent()
-    monkeypatch.setattr(service_module, 'build_agent', lambda: agent)
+    service_for(monkeypatch, agent)
     with TestClient(app) as client:
         service = resource.service
         assert not hasattr(app.state, 'chat_service')
