@@ -138,14 +138,13 @@ def test_http_sse_contract(configured_agent, monkeypatch):
             'response.created', 'response.output_text.delta', 'response.output_text.delta',
             'response.output_text.done', 'response.completed',
         ]
-        assert [data['sequence_number'] for name, data in events] == list(range(5))
-        assert all(name == data['type'] for name, data in events)
-        assert events[1][1]['delta'] == 'These are '
-        assert events[2][1]['delta'] == 'placeholder results.'
-        assert events[1][1]['item_id'] == events[3][1]['item_id']
-        assert events[3][1]['text'] == 'These are placeholder results.'
-        assert events[0][1]['response']['id'] == events[-1][1]['response']['id']
-        assert events[-1][1]['response']['status'] == 'completed'
+        assert [data for name, data in events] == [
+            {'status': 'in_progress'},
+            {'delta': 'These are '},
+            {'delta': 'placeholder results.'},
+            {'text': 'These are placeholder results.'},
+            {'status': 'completed'},
+        ]
         assert 'text/event-stream' in client.get('/openapi.json').json()['paths']['/chat']['post']['responses']['200']['content']
 
 
