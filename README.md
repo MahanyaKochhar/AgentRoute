@@ -58,11 +58,11 @@ response.output_text.done   (data.text contains the accumulated text)
 response.completed
 ```
 
-Failures end with `response.failed`, with an error under `data.response.error`.
-Every payload includes `type` and increasing `sequence_number`. Text events use
-OpenAI SDK types; lifecycle events contain a compact Stream response summary,
-not the full hosted Responses API object. Text from all agent model turns is
-combined into one output item.
+Event names follow OpenAI's conventions; payloads are simple JSON objects:
+`{"status":"in_progress"}`, `{"delta":"..."}`, `{"text":"..."}`, and
+`{"status":"completed"}`. Failures end with `response.failed` and
+`{"message":"Unable to complete the chat request."}`. The done event combines
+text from all agent model turns.
 
 The SSE library handles heartbeats and disconnect cancellation; stalled writes
 time out after 30 seconds. Streams have no replay/resume support. Browser clients
