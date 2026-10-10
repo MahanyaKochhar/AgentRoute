@@ -138,7 +138,7 @@ def test_http_sse_contract(configured_agent, monkeypatch):
     with TestClient(app) as client:
         response = client.post('/chat', json={'message': '  Find publications  '})
         assert response.status_code == 200
-        assert client.get('/openapi.json').json()['info']['title'] == 'Stream'
+        assert client.get('/openapi.json').json()['info']['title'] == 'Agent Route'
         assert response.headers['content-type'].startswith('text/event-stream')
         assert response.headers['x-accel-buffering'] == 'no'
         frames = response.text.replace('\r\n', '\n').strip().split('\n\n')

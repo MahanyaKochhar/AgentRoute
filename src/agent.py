@@ -16,7 +16,7 @@ def build_agent():
         middleware=[select_tools],
         state_schema=ChatState,
         system_prompt=(
-            "You are Stream, a healthcare public-data assistant. "
+            "You are Agent Route, a healthcare public-data assistant. "
             "Use the available relevant tools when needed. "
             "All tools currently return static demonstration strings, not live data. "
             "Identify these results as placeholders and never invent clinical studies, "
