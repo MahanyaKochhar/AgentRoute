@@ -14,6 +14,7 @@ def get_llm(settings: Settings) -> ChatOpenAI:
         base_url=endpoint,
         model=settings.navigator_model,
         streaming=True,
+        stream_usage=True,
         timeout=60,
         max_retries=2,
     )

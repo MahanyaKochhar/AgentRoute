@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,7 +18,9 @@ import src.middleware as middleware_module
 from unittest.mock import patch
 
 # Resource construction is eager; replace model assembly before importing the app.
-with patch("src.service.build_agent", return_value=None):
+with patch("src.service.build_agent", return_value=None), patch(
+    "src.service.Settings", return_value=SimpleNamespace(navigator_model='test-model'),
+):
     from src.main import app
     from src.resource import resource
 from src.middleware import select_tools
@@ -45,7 +48,7 @@ class FakeDecisions:
     async def create(self, **request):
         await asyncio.sleep(0)
         self.calls.append(request)
-        return SimpleNamespace(answers=[
+        return SimpleNamespace(usage=SimpleNamespace(input_tokens=1234, output_tokens=2), answers=[
             SimpleNamespace(type="predicate", name=q["name"],
                             probability=0.5 if q["name"] in self.selected else 0.1)
             for q in request["questions"]
@@ -55,6 +58,7 @@ class FakeDecisions:
 class ToolChatModel(BaseChatModel):
     bound_tools: list[list[str]] = Field(default_factory=list)
     call_tool: bool = True
+    tool_names: tuple[str, ...] = ('pubmed_search_articles',)
 
     @property
     def _llm_type(self):
@@ -67,8 +71,8 @@ class ToolChatModel(BaseChatModel):
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         if self.call_tool and not any(isinstance(m, ToolMessage) for m in messages):
             response = AIMessage(content='', tool_calls=[{
-                'name': 'pubmed_search_articles', 'args': {'query': 'diabetes'}, 'id': 'call-1',
-            }])
+                'name': name, 'args': {'query': 'diabetes'}, 'id': f'call-{index}',
+            } for index, name in enumerate(self.tool_names, start=1)])
         else:
             response = AIMessage(content='These are placeholder results.')
         return ChatResult(generations=[ChatGeneration(message=response)])
@@ -76,15 +80,22 @@ class ToolChatModel(BaseChatModel):
     def _stream(self, messages, stop=None, run_manager=None, **kwargs):
         response = self._generate(messages).generations[0].message
         if response.tool_calls:
-            yield ChatGenerationChunk(message=AIMessageChunk(content='', tool_calls=response.tool_calls))
+            yield ChatGenerationChunk(message=AIMessageChunk(
+                content='', tool_calls=response.tool_calls,
+                usage_metadata={'input_tokens': 20, 'output_tokens': 2, 'total_tokens': 22},
+            ))
         else:
-            for text in ['These are ', 'placeholder results.']:
-                yield ChatGenerationChunk(message=AIMessageChunk(content=text))
+            for index, text in enumerate(['These are ', 'placeholder results.']):
+                yield ChatGenerationChunk(message=AIMessageChunk(
+                    content=text, usage_metadata=(
+                        {'input_tokens': 30, 'output_tokens': 5, 'total_tokens': 35}
+                        if index == 1 else None),
+                ))
 
 
 @pytest.fixture
 def configured_agent(monkeypatch):
-    def build(selected=('pubmed_search_articles',), call_tool=True):
+    def build(selected=('pubmed_search_articles',), call_tool=True, use_decisions=True):
         model = ToolChatModel(call_tool=call_tool)
         classifier = FakeDecisions(selected)
         settings = lambda: SimpleNamespace(
@@ -95,14 +106,15 @@ def configured_agent(monkeypatch):
         monkeypatch.setattr(middleware_module, 'Settings', settings)
         monkeypatch.setattr(agent_module, 'get_llm', lambda settings: model)
         monkeypatch.setattr(middleware_module, 'AsyncOpenAI', lambda **kwargs: classifier)
-        return agent_module.build_agent(), model, classifier
+        return agent_module.build_agent(use_decisions=use_decisions), model, classifier
     return build
 
 
 def service_for(monkeypatch, agent):
-    monkeypatch.setattr(service_module, 'build_agent', lambda: agent)
-    service = ChatService()
-    monkeypatch.setattr(resource, 'service', service)
+    monkeypatch.setattr(service_module, 'build_agent', lambda **kwargs: agent)
+    monkeypatch.setattr(service_module, 'Settings', lambda: SimpleNamespace(navigator_model='test-model'))
+    service = ChatService(use_decisions=True)
+    monkeypatch.setattr(resource, 'routed_service', service)
     return service
 
 
@@ -136,7 +148,7 @@ def test_http_sse_contract(configured_agent, monkeypatch):
     agent, _, _ = configured_agent()
     service_for(monkeypatch, agent)
     with TestClient(app) as client:
-        response = client.post('/chat', json={'message': '  Find publications  '})
+        response = client.post('/v1/chat', json={'message': '  Find publications  '})
         assert response.status_code == 200
         assert client.get('/openapi.json').json()['info']['title'] == 'Stream'
         assert response.headers['content-type'].startswith('text/event-stream')
@@ -157,7 +169,7 @@ def test_http_sse_contract(configured_agent, monkeypatch):
             {'text': 'These are placeholder results.'},
             {'status': 'completed'},
         ]
-        assert 'text/event-stream' in client.get('/openapi.json').json()['paths']['/chat']['post']['responses']['200']['content']
+        assert 'text/event-stream' in client.get('/openapi.json').json()['paths']['/v1/chat']['post']['responses']['200']['content']
 
 
 @pytest.mark.parametrize('payload', [{}, {'message': ''}, {'message': ' \n '},
@@ -166,7 +178,7 @@ def test_http_rejects_invalid_messages(payload, configured_agent, monkeypatch):
     agent, _, classifier = configured_agent()
     service_for(monkeypatch, agent)
     with TestClient(app) as client:
-        assert client.post('/chat', json=payload).status_code == 422
+        assert client.post('/v1/chat', json=payload).status_code == 422
         assert not classifier.calls
 
 
@@ -206,7 +218,7 @@ async def test_concurrent_requests_keep_their_own_tool_selection(monkeypatch):
     assert drug.command.update['tool_scores']['pubmed_search_articles'] == 0.1
 
 
-def test_classifier_failure_emits_sse_error_without_calling_model(configured_agent, monkeypatch):
+def test_classifier_failure_emits_sse_error_without_calling_model(configured_agent, monkeypatch, caplog):
     class FailedDecisions(FakeDecisions):
         async def create(self, **request):
             raise RuntimeError('private upstream failure')
@@ -214,12 +226,16 @@ def test_classifier_failure_emits_sse_error_without_calling_model(configured_age
     agent, model, _ = configured_agent()
     monkeypatch.setattr(middleware_module, 'AsyncOpenAI', lambda **kwargs: FailedDecisions())
     service_for(monkeypatch, agent_module.build_agent())
+    caplog.set_level(logging.ERROR, logger='src')
     with TestClient(app) as client:
-        response = client.post('/chat', json={'message': 'Find publications'})
+        response = client.post('/v1/chat', json={'message': 'Find publications'})
     assert 'event: response.failed' in response.text
     assert 'event: response.completed' not in response.text
     assert 'private upstream failure' not in response.text
     assert not model.bound_tools
+    assert any(record.name == 'src.service' and record.levelno == logging.ERROR
+               and record.exc_info and record.getMessage() == 'Chat stream failed'
+               for record in caplog.records)
 
 
 @pytest.mark.parametrize('endpoint', ['https://example.test/v1', 'https://example.test/v1/chat/completions/'])
@@ -288,7 +304,7 @@ async def test_http_disconnect_cancels_underlying_agent(monkeypatch):
         await asyncio.wait_for(app({
             'type': 'http', 'asgi': {'version': '3.0', 'spec_version': '2.3'},
             'http_version': '1.1', 'method': 'POST', 'scheme': 'http',
-            'path': '/chat', 'raw_path': b'/chat', 'query_string': b'',
+            'path': '/v1/chat', 'raw_path': b'/v1/chat', 'query_string': b'',
             'headers': [(b'content-type', b'application/json')],
             'client': ('127.0.0.1', 1234), 'server': ('test', 80),
         }, receive, send), timeout=3)
@@ -307,7 +323,7 @@ def test_blank_openai_key_allows_app_but_blocks_routing(configured_agent, monkey
     service_for(monkeypatch, agent)
     with TestClient(app) as client:
         assert client.get('/openapi.json').status_code == 200
-        response = client.post('/chat', json={'message': 'Find publications'})
+        response = client.post('/v1/chat', json={'message': 'Find publications'})
     assert 'event: response.failed' in response.text
     assert not decisions.calls
     assert not model.bound_tools
@@ -377,12 +393,50 @@ def test_resource_owns_one_service_with_independent_request_state(configured_age
     agent, _, decisions = configured_agent()
     service_for(monkeypatch, agent)
     with TestClient(app) as client:
-        service = resource.service
+        service = resource.routed_service
         assert not hasattr(app.state, 'chat_service')
-        first = client.post('/chat', json={'message': 'Find publications'})
-        second = client.post('/chat', json={'message': 'Find other publications'})
-        assert resource.service is service
+        first = client.post('/v1/chat', json={'message': 'Find publications'})
+        second = client.post('/v1/chat', json={'message': 'Find other publications'})
+        assert resource.routed_service is service
         assert 'event: response.completed' in first.text
         assert 'event: response.completed' in second.text
     assert len(decisions.calls) == 2
     assert [call['input'] for call in decisions.calls] == ['Find publications', 'Find other publications']
+
+
+def test_simulate_diabetes_chat(configured_agent, monkeypatch, caplog):
+    """Run the real HTTP/agent loop with deterministic external API responses."""
+    selected = ('clinicaltrials_gov_search_trials', 'pubmed_search_articles')
+    agent, model, decisions = configured_agent(selected)
+    model.tool_names = selected
+    service_for(monkeypatch, agent)
+    caplog.set_level(logging.INFO, logger='src')
+    payload = {'message': 'Find diabetes trials and publications.'}
+    with TestClient(app) as client:
+        response = client.post('/v1/chat', json=payload)
+
+    records = [record.getMessage() for record in caplog.records if record.name.startswith('src.')]
+    assert len(decisions.calls) == 1
+    assert decisions.calls[0]['input'] == payload['message']
+    assert len(decisions.calls[0]['questions']) == 94
+    assert model.bound_tools == [list(selected)] * 2
+    metrics = [json.loads(record.removeprefix('metrics ')) for record in records if record.startswith('metrics ')]
+    decision = next(record for record in metrics if record.get('kind') == 'decision')
+    assert decision['input_tokens'] == 1234
+    assert decision['output_tokens'] == 2
+    assert f'tools.selected names={list(selected)}' in records
+    assert sum(record.startswith('tools.selected ') for record in records) == 1
+    for name in selected:
+        assert records.count(f'tool.call name={name} args={{"query": "diabetes"}}') == 1
+    assert response.status_code == 200
+    assert 'event: response.completed' in response.text
+    assert 'event: response.failed' not in response.text
+    assert 'These are placeholder results.' in response.text
+    assert 'decision.result' not in response.text
+
+    print('\nSIMULATION: mocked Decisions and Navigator; real /v1/chat, agent, and placeholder tools')
+    print('POST /v1/chat ' + json.dumps(payload))
+    for record in records:
+        print('INFO ' + record)
+    print('\nSSE response:\n' + response.text)
+    print('Verified: 1 Decisions invocation, 2 Navigator turns, 2 tool executions.')
