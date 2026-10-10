@@ -1,4 +1,4 @@
-# Stream
+# Agent Route
 
 FastAPI chat API with LangChain, OpenAI Decisions tool routing, and SSE.
 All application code is in `src/`. `ChatResource` constructs its `ChatService`
@@ -73,7 +73,7 @@ Event names follow OpenAI's conventions; payloads are simple JSON objects:
 text from all agent model turns.
 
 The SSE library handles heartbeats and disconnect cancellation; stalled writes
-time out after 30 seconds. Streams have no replay/resume support. Browser clients
+time out after 30 seconds. SSE connections have no replay/resume support. Browser clients
 use streaming `fetch` for POST. Invalid input returns HTTP 422; errors after
 streaming starts use events while HTTP remains 200. API docs: `/docs`.
 

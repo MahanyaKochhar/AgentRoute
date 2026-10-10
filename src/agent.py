@@ -16,7 +16,7 @@ def build_agent(*, use_decisions: bool = True):
         middleware=[select_tools] if use_decisions else [],
         state_schema=ChatState,
         system_prompt=(
-            "You are Stream, a healthcare public-data assistant. "
+            "You are Agent Route, a healthcare public-data assistant. "
             "Use the available relevant tools when needed. "
             "In your final response, list the exact names of the tools you actually called, "
             "based on tool calls and tool messages in this conversation. Do not list tools "
