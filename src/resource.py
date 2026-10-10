@@ -18,13 +18,14 @@ class ChatResource:
         self.service = ChatService()
         self.router = APIRouter()
 
-        @self.router.post(
-            "/chat", response_class=EventSourceResponse,
-            responses={200: {"content": {"text/event-stream": {}}}},
-        )
-        async def chat(payload: ChatRequest) -> EventSourceResponse:
-            return sse_response(self.service.stream(payload.message))
-
 
 load_dotenv()
 resource = ChatResource()
+
+
+@resource.router.post(
+    "/chat", response_class=EventSourceResponse,
+    responses={200: {"content": {"text/event-stream": {}}}},
+)
+async def chat(payload: ChatRequest) -> EventSourceResponse:
+    return sse_response(resource.service.stream(payload.message))
