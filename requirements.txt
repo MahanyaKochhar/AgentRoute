@@ -4,6 +4,7 @@ sse-starlette==3.5.0
 langchain==1.4.3
 langchain-openai==1.6.7
 langchain-typesafe==0.0.1a3
+openai==3.26.0
 pydantic>=2.7,<3
 pydantic-settings>=2.2,<3
 python-dotenv>=1,<2

@@ -14,7 +14,12 @@ from pydantic import Field
 import src.agent as agent_module
 import src.service as service_module
 import src.middleware as middleware_module
-from src.main import app
+from unittest.mock import patch
+
+# Resource construction is eager; replace model assembly before importing the app.
+with patch("src.service.build_agent", return_value=None):
+    from src.main import app
+    from src.resource import resource
 from src.middleware import select_tools
 from src.navigator_llm import get_llm
 from src.service import ChatService
@@ -84,7 +89,9 @@ def configured_agent(monkeypatch):
 
 def service_for(monkeypatch, agent):
     monkeypatch.setattr(service_module, 'build_agent', lambda: agent)
-    return ChatService()
+    service = ChatService()
+    monkeypatch.setattr(resource, 'service', service)
+    return service
 
 
 @pytest.mark.asyncio
@@ -127,8 +134,18 @@ def test_http_sse_contract(configured_agent, monkeypatch):
         for frame in frames:
             lines = frame.splitlines()
             events.append((lines[0].removeprefix('event: '), json.loads(lines[1].removeprefix('data: '))))
-        assert events == [('token', {'text': 'These are '}),
-                          ('token', {'text': 'placeholder results.'}), ('done', {'status': 'complete'})]
+        assert [name for name, data in events] == [
+            'response.created', 'response.output_text.delta', 'response.output_text.delta',
+            'response.output_text.done', 'response.completed',
+        ]
+        assert [data['sequence_number'] for name, data in events] == list(range(5))
+        assert all(name == data['type'] for name, data in events)
+        assert events[1][1]['delta'] == 'These are '
+        assert events[2][1]['delta'] == 'placeholder results.'
+        assert events[1][1]['item_id'] == events[3][1]['item_id']
+        assert events[3][1]['text'] == 'These are placeholder results.'
+        assert events[0][1]['response']['id'] == events[-1][1]['response']['id']
+        assert events[-1][1]['response']['status'] == 'completed'
         assert 'text/event-stream' in client.get('/openapi.json').json()['paths']['/chat']['post']['responses']['200']['content']
 
 
@@ -187,8 +204,8 @@ def test_classifier_failure_emits_sse_error_without_calling_model(configured_age
     service_for(monkeypatch, agent_module.build_agent())
     with TestClient(app) as client:
         response = client.post('/chat', json={'message': 'Find publications'})
-    assert 'event: error' in response.text
-    assert 'event: done' not in response.text
+    assert 'event: response.failed' in response.text
+    assert 'event: response.completed' not in response.text
     assert 'private upstream failure' not in response.text
     assert not model.bound_tools
 
@@ -252,7 +269,7 @@ async def test_http_disconnect_cancels_underlying_agent(monkeypatch):
         return {'type': 'http.disconnect'}
     async def send(event):
         sent.append(event)
-        if b'event: token' in event.get('body', b''):
+        if b'event: response.output_text.delta' in event.get('body', b''):
             disconnected.set()
 
     async with app.router.lifespan_context(app):
@@ -264,4 +281,21 @@ async def test_http_disconnect_cancels_underlying_agent(monkeypatch):
             'client': ('127.0.0.1', 1234), 'server': ('test', 80),
         }, receive, send), timeout=3)
     assert closed.is_set()
-    assert not any(b'event: done' in event.get('body', b'') for event in sent)
+    assert not any(b'event: response.completed' in event.get('body', b'') for event in sent)
+
+
+def test_resource_owns_one_service_with_independent_request_state(configured_agent, monkeypatch):
+    from src.resource import resource
+
+    agent, _, decisions = configured_agent()
+    service_for(monkeypatch, agent)
+    with TestClient(app) as client:
+        service = resource.service
+        assert not hasattr(app.state, 'chat_service')
+        first = client.post('/chat', json={'message': 'Find publications'})
+        second = client.post('/chat', json={'message': 'Find other publications'})
+        assert resource.service is service
+        assert 'event: response.completed' in first.text
+        assert 'event: response.completed' in second.text
+    assert len(decisions.calls) == 2
+    assert [call['state'] for call in decisions.calls] == ['Find publications', 'Find other publications']
