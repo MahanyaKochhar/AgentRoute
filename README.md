@@ -1,4 +1,4 @@
-# Stream
+# Agent Route
 
 FastAPI chat API with LangChain, Jev tool routing, and SSE.
 All application code is in `src/`. `ChatResource` creates its `ChatService`
