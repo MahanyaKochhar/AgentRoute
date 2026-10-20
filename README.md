@@ -1,29 +1,16 @@
 # Agent Route
 
-FastAPI chat API with LangChain, OpenAI Decisions tool routing, and SSE.
-All application code is in `src/`. `ChatResource` constructs its `ChatService`
-directly and registers two routes; no lifespan initialization.
+Dynamically Selecting Tools in Langchain Agent with OpenAI Decisions API in custom Middleware.
 
-```text
-POST /chat    → all-tools agent → Navigator → tools
-POST /v1/chat → routed agent → Decisions → Navigator → selected tools
-```
+## Endpoints
 
-Both agents use the same Navigator model, system prompt, tool catalogue, and fresh
-request state. `/chat` exposes all 94 tools and has no middleware. `/v1/chat` uses
-`select_tools` middleware.
+| Endpoint | Tools available to Navigator | Routing |
+|---|---|---|
+| `POST /chat` | All 94 tools | None |
+| `POST /v1/chat` | Tools scoring ≥ `TOOL_THRESHOLD` | One Decisions call per request |
 
-**Routing on `/v1/chat`:** one Decisions invocation evaluates 94 named predicates against the
-user request. Scores select tools using `TOOL_THRESHOLD` and are reused throughout
-the agent run. The SDK can retry failed HTTP attempts. Each request starts a new
-run; no conversation history is retained. Navigator generates the answer.
-
-**Tools:** all 94 operations from Healthcare Public Data are static placeholders.
-They return no live healthcare data.
-
-**State:** `ChatState` extends LangChain's message state with the original
-`request` and optional `tool_scores`. `state_schema=ChatState` registers those
-fields with the agent so scores persist between model/tool steps, per request.
+Both agents share the model and prompt. Scores persist across model turns; each request starts fresh.
+**All tools return static placeholders. No live healthcare searches run, as of now**
 
 ## Run
 
@@ -33,132 +20,103 @@ Python 3.11+:
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env  # first setup only; preserve existing credentials
 uvicorn src.main:app --reload
 ```
 
-Set `NAVIGATOR_API_KEY`, `NAVIGATOR_API_ENDPOINT`, and `NAVIGATOR_MODEL` in `.env`.
-Navigator must support streaming and tool calling. The OpenAI key is intentionally
-blank: `/chat` works without it, but `/v1/chat` routing requires `OPENAI_API_KEY`.
-Allow network access to `api.openai.com` for Decisions.
+| Configuration | Purpose / default |
+|---|---|
+| `NAVIGATOR_API_KEY`, `NAVIGATOR_API_ENDPOINT`, `NAVIGATOR_MODEL` | Streaming, tool-capable answer model |
+| `OPENAI_API_KEY` | Required for `/v1/chat` Decisions routing |
+| `DECISION_MODEL` | `gpt-6-luna` |
+| `TOOL_THRESHOLD` / `DECISION_TIMEOUT_SECONDS` | `0.5` / `30` seconds |
+| `LANGFUSE_BASE_URL` | Local instance: `http://localhost:3000` |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Langfuse project credentials |
 
-Defaults: `DECISION_MODEL=gpt-6-luna`, `DECISION_TIMEOUT_SECONDS=30`,
-`TOOL_THRESHOLD=0.5`. Tune the threshold on labeled requests before production.
 
-## Chat API
-
-```bash
-curl -N http://127.0.0.1:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"Find diabetes trials and publications."}'
-
-curl -N http://127.0.0.1:8000/v1/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message":"Find diabetes trials and publications."}'
-```
-
-SSE event sequence:
-
-```text
-response.created
-response.output_text.delta  (repeated; append data.delta)
-response.output_text.done   (data.text contains the accumulated text)
-response.completed
-```
-
-Event names follow OpenAI's conventions; payloads are simple JSON objects:
-`{"status":"in_progress"}`, `{"delta":"..."}`, `{"text":"..."}`, and
-`{"status":"completed"}`. Failures end with `response.failed` and
-`{"message":"Unable to complete the chat request."}`. The done event combines
-text from all agent model turns.
-
-The SSE library handles heartbeats and disconnect cancellation; stalled writes
-time out after 30 seconds. SSE connections have no replay/resume support. Browser clients
-use streaming `fetch` for POST. Invalid input returns HTTP 422; errors after
-streaming starts use events while HTTP remains 200. API docs: `/docs`.
-
-## Tests
+## Try both routes
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest -q
+for route in chat v1/chat; do
+  curl -N "http://localhost:8000/$route" \
+    -H 'Content-Type: application/json' \
+    -d '{"message":"Use dailymed_search_labels to look up Tylenol ingredients."}'
+done
 ```
 
-Tests use mocked models and Decisions responses, including the real OpenAI SDK
-with a mock HTTP transport. No live API key is needed.
+## Traces
 
-## INFO logs and comparison
+- The resource creates one UUID string for the header, run ID, and metadata. Langfuse uses the same ID without hyphens.
+- Root names: `chat.<approach>.<request_id>`. The LangChain callback records Navigator and tool steps.
+- Decisions keeps its direct SDK call and records API-reported usage in one generation.
 
-`src/logger.py` configures INFO logging to `logs/app.log` under the project root,
-with application logs excluded from the console. Logs include selected tool names,
-actual tool calls with arguments, errors with tracebacks, and structured `metrics`
-JSON records. Each response includes an `X-Request-ID` header correlating its logs.
-Decisions answers, tool results, and routine model/chat progress are not logged.
+## Langfuse setup
 
-`api.call` records measure every Navigator turn and Decisions invocation: approach,
-request ID, model, input tokens, output tokens, latency in milliseconds, and status.
-LangChain callbacks measure model calls without adding logging middleware. Navigator
-streaming requests ask the gateway to include token usage. Missing usage is `null`,
-not an estimate or zero. Failed calls also record latency and error type; usage
-is usually unavailable. SDK retries are included in call latency and are not
-separate application invocations; unreported token usage from failed attempts
-cannot be included in totals.
+1. Start the existing `agentroute-langfuse` stack in Docker Desktop. For a new installation, follow the [official Docker setup](https://langfuse.com/self-hosting/deployment/docker-compose).
+2. Open [localhost:3000](http://localhost:3000), create an account and project, then generate project API keys.
+3. Add the keys to the application's `.env`:
 
-`request.completed` records include status (completed/failed/cancelled), duration,
-time to first text, model/Decisions call counts, selected and executed tools,
-separate model and Decisions token totals, and combined input/output token totals.
-Request duration covers the service stream, including routing, model calls, tools,
-and streaming backpressure; it excludes HTTP validation and the final SSE framing.
-The benchmark separately measures client duration through the full SSE response.
-No Decisions calls on `/chat` means its Decisions totals are zero. Missing usage
-from any invoked API makes the corresponding aggregate `null`.
-These are server diagnostics; they are not added to the SSE response.
-Application modules use standard Python `logging.getLogger(__name__)` and
-`logger.info(...)`. Tool functions log directly through their placeholder helper;
-there is no logging middleware.
+   ```dotenv
+   LANGFUSE_BASE_URL=http://localhost:3000
+   LANGFUSE_PUBLIC_KEY=your-project-public-key
+   LANGFUSE_SECRET_KEY=your-project-secret-key
+   ```
 
-Run the reproducible simulation without external API requests:
+4. Restart FastAPI, send a chat request, and open **Tracing** in Langfuse. Match the trace to the response's `X-Request-ID` (without hyphens).
 
-```bash
-python -m pytest tests/test_chat.py::test_simulate_diabetes_chat -q -s
-```
+## Token cost comparison
 
-It posts `{"message":"Find diabetes trials and publications."}` through the actual
-`/v1/chat` route and agent loop, with mocked Decisions and Navigator responses. The
-mock assigns 0.5 to `clinicaltrials_gov_search_trials` and `pubmed_search_articles`,
-and 0.1 to the other 92 predicates. These are illustrative scores, not live results.
-The printed trace shows metrics, selected tools, and executed calls only.
+**Result:** the routed request costs an estimated **$0.004708**, compared with **$0.038502** for all tools — **87.77% less** in this sample.
 
-1. `/v1/chat` starts SSE and the service creates fresh request state.
-2. `select_tools` invokes Decisions before the first Navigator call, validates the
-   94 answers, and exposes tools scoring at least `TOOL_THRESHOLD` to Navigator.
-3. Navigator chooses tool calls and arguments. Selection alone does not execute tools.
-4. The agent executes requested tools and adds their results as tool messages.
-5. Before the next Navigator turn, middleware reuses stored scores without another
-   Decisions invocation. Navigator receives the tool results and generates text.
-6. Text streams as SSE deltas, followed by done/completed events.
+These estimates apply **GPT-6.1 Sol prices to recorded Gemma usage**. They are not actual GPT-6.1 Sol bills.
 
-This simulation verifies one Decisions invocation, two Navigator turns, and two
-placeholder tool executions. Live scores, tool calls, ordering, and number of turns
-depend on the APIs' responses; the SDK may retry Decisions HTTP attempts.
+### Prices used
 
-With the server running, run paired real API comparisons:
+USD per **1 million tokens**, verified October 20, 2026; Standard short-context rates:
 
-```bash
-python scripts/compare_agents.py --repeats 3 \
-  --expected-tool clinicaltrials_gov_search_trials \
-  --expected-tool pubmed_search_articles
-```
+| API / assumed model | Input price | Output price |
+|---|---:|---:|
+| Navigator → [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) | $2.00 | $10.00 |
+| [Decisions → GPT-6 Luna](https://developers.openai.com/api/docs/guides/decisions#pricing-and-availability) | $0.10 | $0.00 |
 
-This sends six live requests, alternates endpoint order, and writes
-`logs/comparison.json` with responses, per-call metrics, success counts, token
-totals, mean/median/p95 latencies, measurement coverage, and exact tool-set match
-rates against the supplied expected tools. The console prints a comparison table.
-Use `--message`, `--expected-tool`, and `--output` to repeat across labeled queries.
-Include Decisions tokens and latency when judging routing savings. Failures are
-reported separately from completed-request averages. Small samples, provider
-caching, model variability, and placeholder tools limit conclusions; inspect saved
-responses and tool choices as well as token/latency statistics. Exact tool-set match
-is only a routing check, not a measure of answer quality. No pricing is assumed.
+Decisions charges for input only. No cached input was recorded in these runs.
 
-[Decisions guide](https://developers.openai.com/api/docs/guides/decisions)
+### Tokens recorded in Langfuse
+
+Both endpoints received the same question:
+
+> Use dailymed_search_labels to look up Tylenol ingredients.
+
+Each invoked that tool once and made two Navigator calls. Counts below sum only generation observations; output includes reported reasoning tokens.
+
+| Tokens | `/chat` — all tools | `/v1/chat` — routed |
+|---|---:|---:|
+| Navigator input | 18,661 | 613 |
+| Navigator output | 118 | 128 |
+| Decisions input | 0 | 22,018 |
+| Decisions output | 0 | 0 |
+
+### Estimated cost per request
+
+For each API, multiply its token counts by its prices, then divide by 1,000,000.
+
+| Cost component | `/chat` — all tools | `/v1/chat` — routed |
+|---|---:|---:|
+| Navigator input | $0.037322 | $0.001226 |
+| Navigator output | $0.001180 | $0.001280 |
+| Decisions input | $0.000000 | $0.002202 |
+| Decisions output | $0.000000 | $0.000000 |
+| **Total** | **$0.038502** | **$0.004708** |
+
+**Saving: about $0.033794 per request (87.77%).** Routing sent more input tokens overall, but most went to the cheaper Decisions API.
+
+### Timing and limitations
+
+| Langfuse measurement | `/chat` — all tools | `/v1/chat` — routed |
+|---|---:|---:|
+| Request duration | 3.199 s | 4.628 s |
+| Decisions duration | — | 1.853 s |
+
+This is **one pair of requests**, measured October 20, 2026. Routing was cheaper under the assumed prices but slower in this sample. Navigator ran `gemma-4-31b-it`; GPT-6.1 Sol costs are used for frontier model comparisons.
+
+[Recorded observations and exact calculations](results/langfuse-cost-comparison.json)

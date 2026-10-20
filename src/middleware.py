@@ -1,22 +1,17 @@
 """Select tools with named OpenAI Decisions predicates over the user request."""
 import math
-import logging
-from asyncio import CancelledError
-from time import perf_counter
 from collections.abc import Awaitable, Callable
 
 from langchain.agents.middleware import (
     ExtendedModelResponse, ModelRequest, ModelResponse, wrap_model_call,
 )
+from langfuse import get_client
 from langgraph.types import Command
 from openai import AsyncOpenAI
 
 from src.settings import Settings
 from src.state import ChatState
 from src.tools import HEALTHCARE_TOOLS
-from src.metrics import current_metrics, token_count
-
-logger = logging.getLogger(__name__)
 
 QUESTIONS = [
     {
@@ -55,44 +50,30 @@ async def select_tools(
 ) -> ExtendedModelResponse:
     settings = Settings()
     scores = request.state.get("tool_scores")
-    first_turn = scores is None
-    metrics = current_metrics.get()
     if scores is None:
         api_key = settings.openai_api_key.get_secret_value()
         if not api_key.strip():
             raise ValueError("OPENAI_API_KEY is required for Decisions tool routing.")
-        started = perf_counter()
-        try:
+        with get_client().start_as_current_observation(
+            name="decisions", as_type="generation", model=settings.decision_model,
+            input={"request": request.state["request"], "questions": QUESTIONS},
+        ) as generation:
             async with AsyncOpenAI(
-                api_key=api_key,
-                base_url="https://api.openai.com/v1",
-                timeout=settings.decision_timeout_seconds,
-                max_retries=2,
+                api_key=api_key, base_url="https://api.openai.com/v1",
+                timeout=settings.decision_timeout_seconds, max_retries=2,
             ) as client:
                 decision = await client.decisions.create(
                     model=settings.decision_model,
-                    input=request.state["request"],
-                    questions=QUESTIONS,
+                    input=request.state["request"], questions=QUESTIONS,
                 )
-        except BaseException as error:
-            if metrics:
-                metrics.api_call("decision", settings.decision_model, started,
-                                 status="cancelled" if isinstance(error, CancelledError) else "failed",
-                                 error=error)
-            raise
-        usage = getattr(decision, "usage", None)
-        if metrics:
-            metrics.api_call("decision", settings.decision_model, started, usage)
-        else:
-            logger.info("decision.usage input_tokens=%s output_tokens=%s latency_ms=%.2f",
-                        token_count(usage, "input_tokens"), token_count(usage, "output_tokens"),
-                        (perf_counter() - started) * 1000)
-        scores = predicate_scores(decision.answers)
+            scores = predicate_scores(decision.answers)
+            usage = getattr(decision, "usage", None)
+            generation.update(
+                output=scores,
+                usage_details={"input": usage.input_tokens, "output": usage.output_tokens}
+                              if usage is not None else None,
+            )
 
     selected = [tool for tool in request.tools if scores[tool.name] >= settings.tool_threshold]
-    if first_turn:
-        if metrics:
-            metrics.selected_tools = [tool.name for tool in selected]
-        logger.info("tools.selected names=%s", [tool.name for tool in selected])
     response = await handler(request.override(tools=selected))
     return ExtendedModelResponse(response, Command(update={"tool_scores": scores}))

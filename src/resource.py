@@ -1,4 +1,5 @@
 """Expose the all-tools and Decisions agents with the same SSE contract."""
+from collections.abc import AsyncIterator, Callable
 from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import APIRouter
@@ -16,8 +17,7 @@ class ChatRequest(BaseModel):
 
 class ChatResource:
     def __init__(self):
-        self.service = ChatService(use_decisions=False)
-        self.routed_service = ChatService(use_decisions=True)
+        self.service = ChatService()
         self.router = APIRouter()
 
 
@@ -30,12 +30,12 @@ resource = ChatResource()
     responses={200: {"content": {"text/event-stream": {}}}},
 )
 async def chat(payload: ChatRequest) -> EventSourceResponse:
-    return chat_response(resource.service, payload.message)
+    return chat_response(resource.service.stream, payload.message)
 
 
-def chat_response(service: ChatService, message: str) -> EventSourceResponse:
+def chat_response(stream: Callable[[str, str], AsyncIterator[str]], message: str) -> EventSourceResponse:
     request_id = str(uuid4())
-    response = sse_response(service.stream(message, request_id))
+    response = sse_response(stream(message, request_id))
     response.headers["X-Request-ID"] = request_id
     return response
 
@@ -45,4 +45,4 @@ def chat_response(service: ChatService, message: str) -> EventSourceResponse:
     responses={200: {"content": {"text/event-stream": {}}}},
 )
 async def routed_chat(payload: ChatRequest) -> EventSourceResponse:
-    return chat_response(resource.routed_service, payload.message)
+    return chat_response(resource.service.stream_routed, payload.message)

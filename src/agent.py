@@ -10,6 +10,7 @@ from src.tools import HEALTHCARE_TOOLS
 
 def build_agent(*, use_decisions: bool = True):
     settings = Settings()
+    
     return create_agent(
         model=get_llm(settings),
         tools=HEALTHCARE_TOOLS,

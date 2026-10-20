@@ -3,16 +3,10 @@
 Each operation retains its connector-prefixed name and has a simple query input.
 No public-data APIs are called. Catalogue verified against the installed plugin.
 """
-import logging
-import json
 
 from langchain.tools import tool
 
-logger = logging.getLogger(__name__)
-
-
 def _placeholder(name: str, query: str) -> str:
-    logger.info("tool.call name=%s args=%s", name, json.dumps({"query": query}))
     return f"{name}: static placeholder response."
 
 
