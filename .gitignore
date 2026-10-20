@@ -4,3 +4,4 @@ __pycache__
 .langgraph_api
 
 .pytest_cache
+logs/

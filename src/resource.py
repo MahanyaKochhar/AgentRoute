@@ -1,4 +1,6 @@
-"""The chat resource owns its service and exposes POST /chat."""
+"""Expose the all-tools and Decisions agents with the same SSE contract."""
+from collections.abc import AsyncIterator, Callable
+from uuid import uuid4
 from dotenv import load_dotenv
 from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict, Field
@@ -28,4 +30,19 @@ resource = ChatResource()
     responses={200: {"content": {"text/event-stream": {}}}},
 )
 async def chat(payload: ChatRequest) -> EventSourceResponse:
-    return sse_response(resource.service.stream(payload.message))
+    return chat_response(resource.service.stream, payload.message)
+
+
+def chat_response(stream: Callable[[str, str], AsyncIterator[str]], message: str) -> EventSourceResponse:
+    request_id = str(uuid4())
+    response = sse_response(stream(message, request_id))
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@resource.router.post(
+    "/v1/chat", response_class=EventSourceResponse,
+    responses={200: {"content": {"text/event-stream": {}}}},
+)
+async def routed_chat(payload: ChatRequest) -> EventSourceResponse:
+    return chat_response(resource.service.stream_routed, payload.message)

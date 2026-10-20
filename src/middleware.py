@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from langchain.agents.middleware import (
     ExtendedModelResponse, ModelRequest, ModelResponse, wrap_model_call,
 )
+from langfuse import get_client
 from langgraph.types import Command
 from openai import AsyncOpenAI
 
@@ -53,18 +54,25 @@ async def select_tools(
         api_key = settings.openai_api_key.get_secret_value()
         if not api_key.strip():
             raise ValueError("OPENAI_API_KEY is required for Decisions tool routing.")
-        async with AsyncOpenAI(
-            api_key=api_key,
-            base_url="https://api.openai.com/v1",
-            timeout=settings.decision_timeout_seconds,
-            max_retries=2,
-        ) as client:
-            decision = await client.decisions.create(
-                model=settings.decision_model,
-                input=request.state["request"],
-                questions=QUESTIONS,
+        with get_client().start_as_current_observation(
+            name="decisions", as_type="generation", model=settings.decision_model,
+            input={"request": request.state["request"], "questions": QUESTIONS},
+        ) as generation:
+            async with AsyncOpenAI(
+                api_key=api_key, base_url="https://api.openai.com/v1",
+                timeout=settings.decision_timeout_seconds, max_retries=2,
+            ) as client:
+                decision = await client.decisions.create(
+                    model=settings.decision_model,
+                    input=request.state["request"], questions=QUESTIONS,
+                )
+            scores = predicate_scores(decision.answers)
+            usage = getattr(decision, "usage", None)
+            generation.update(
+                output=scores,
+                usage_details={"input": usage.input_tokens, "output": usage.output_tokens}
+                              if usage is not None else None,
             )
-        scores = predicate_scores(decision.answers)
 
     selected = [tool for tool in request.tools if scores[tool.name] >= settings.tool_threshold]
     response = await handler(request.override(tools=selected))
